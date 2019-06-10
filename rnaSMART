@@ -1,0 +1,608 @@
+#!/usr/bin/python3
+import matplotlib
+
+# Force matplotlib to not use any Xwindows backend.
+matplotlib.use('Agg')
+from matplotlib import pyplot as plt
+import os
+import sys
+import threading
+import argparse
+import time
+import shutil
+import pybedtools
+import random
+import string
+import numpy as np
+import fastcluster
+from scipy.cluster.hierarchy import dendrogram, linkage, distance, fcluster
+
+from multiprocessing import Lock
+from subprocess import check_output
+from additional_classes import Cluster, Hairpin, Motif, StructureInfo
+from bracket_to_shape_new import Structure
+from stem_clustering import StemClustering
+from sequence_clustering import SequenceClustering
+from alignment import Alignment
+from scipy.spatial.distance import pdist, squareform
+from Bio import pairwise2
+from alignment_free import AlignmentFree
+
+L = Lock()
+
+
+def fancy_dendrogram(*args, **kwargs):
+    max_d = kwargs.pop('max_d', None)
+    if max_d and 'color_threshold' not in kwargs:
+        kwargs['color_threshold'] = max_d
+    annotate_above = kwargs.pop('annotate_above', 0)
+
+    ddata = dendrogram(*args, **kwargs)
+
+    if not kwargs.get('no_plot', False):
+        for i, d, c in zip(ddata['icoord'], ddata['dcoord'], ddata['color_list']):
+            x = 0.5 * sum(i[1:3])
+            y = d[1]
+            if y > annotate_above:
+                plt.plot(x, y, 'o', c=c)
+                plt.annotate("%.3g" % y, (x, y), xytext=(0, -5),
+                             textcoords='offset points',
+                             va='top', ha='center')
+        if max_d:
+            plt.axhline(y=max_d, c='k')
+    return ddata
+
+
+class rnaSMART:
+    def __init__(self, inputf, output, thread, strdistance, seqdistance, hairpins, form, redundancy):
+        self.input_file = inputf
+        self.output_file = output
+        self.strdistance = strdistance
+        self.seqdistance = seqdistance
+        self.thread_number = thread
+        self.single_hairpins = hairpins
+        self.form = form
+        self.save_redundancy = redundancy
+        self.initial_motifs = {}
+        self.motifs = {}
+        self.final_result = []
+        self.start = 0
+
+    def parse_input_file(self):
+        self.start = time.time()
+        #print("parse input..")
+        with open(self.input_file) as inpt:
+            for i in inpt:
+                if i.startswith(">"):
+                    domains = self.add_shapes(i.strip(), inpt.readline().strip(), inpt.readline().strip())
+                    for d in domains:
+                        if self.single_hairpins == "False" and d.shape != "[]":
+                            if d.shape in self.initial_motifs:
+                                self.initial_motifs[d.shape].append(d)
+                            else:
+                                self.initial_motifs[d.shape] = []
+                                self.initial_motifs[d.shape].append(d)
+                        elif self.single_hairpins == "True":
+                            if d.shape in self.initial_motifs:
+                                self.initial_motifs[d.shape].append(d)
+                            else:
+                                self.initial_motifs[d.shape] = []
+                                self.initial_motifs[d.shape].append(d)
+        #print("distances..")
+
+        if float(self.strdistance) != -1:
+            self.calculate_distances_inside_motif()
+            del self.initial_motifs
+        else:
+            self.parse_results_without_distance()
+
+        #print("result...")
+        self.create_result_file()
+
+    def parse_results_without_distance(self):
+        #print("without distances")
+        for key in self.initial_motifs:
+            count = len(self.initial_motifs[key])
+            if count > 1:
+                lengths = []
+                ids = []
+                sequences = []
+                structures = []
+                for domain in self.initial_motifs[key]:
+                    start = int(domain.id.split("|")[1].split("-")[0])
+                    stop = int(domain.id.split("|")[1].split("-")[1])
+                    lengths.append(stop - start)
+                    ids.append(domain.id)
+                    sequences.append(domain.sequence)
+                    structures.append(domain.structure)
+                med_length = np.median(lengths)
+                c = Cluster()
+                c.count = count
+                c.med_length = med_length
+                c.ids = ids
+                c.seqs = sequences
+                c.structs = structures
+                self.motifs[key] = []
+                self.motifs[key].append(c)
+
+    def matrix_to_pairs(self, matrix, id_list):
+        distance_pairs = []
+        for i, m in enumerate(matrix.split("\n")):
+            if len(m.strip().split(",")[:-1]) > 1:
+                for j, v in enumerate(m.strip().split(",")[:-1]):
+                    if float(v) <= float(self.distance):
+                        distance_pairs.append(" ".join([id_list[i], id_list[j], v]))
+        return distance_pairs
+
+    def create_result_file(self):
+        id = 0
+        for i, k in enumerate(sorted(self.motifs, key=len, reverse=True)):
+            for j, l in enumerate(self.motifs[k]):
+                self.motifs[k][j].motif_id = id
+                id += 1
+
+        self.add_parents()
+
+    def add_parents(self):
+        for i in sorted(self.motifs, key=len, reverse=True):
+            for j in sorted(self.motifs, key=len, reverse=True):
+                if i in j and i != j:
+                    for m in self.motifs[i]:
+                        for n in self.motifs[j]:
+                            m.parent.append(n.motif_id)
+        if self.form == "4sale":
+            self.save_to_result_file_with_alignment()
+        else:
+            self.save_to_result_file_without_alignment()
+
+    def save_to_result_file_without_alignment(self):  # fasta
+        tmp = False
+        lines = []
+        with open(os.path.join(self.output_file), 'w') as output:
+            for k in sorted(self.motifs, key=len, reverse=True):
+                for m in self.motifs[k]:
+                    if len(m.parent) != 0:
+                        tmp = True
+                        line = "@ID: " + str(m.motif_id) + "; Parent: " + ", ".join(
+                            str(x) for x in m.parent) + "; Count: " \
+                               + str(m.count) \
+                               + "; Length: " + str(m.med_length) \
+                               + "; Shape: " + k + "; Distance_str: " + str(
+                            m.struct_distance) + "; Distance_seq: " + str(m.med_distance) + "\n"
+                    else:
+                        tmp = True
+                        line = "@ID: " + str(m.motif_id) + "; Parent: self; Count: " + str(m.count)
+                        line += "; Length: " + str(m.med_length)
+                        line += "; Shape: " + k + "; Distance_str: " + str(
+                            m.struct_distance) + "; Distance_seq: " + str(m.med_distance) + "\n"
+
+                    output.write(line + "\n")
+                    for s in range(len(m.ids)):
+                        output.write(m.ids[s] + "\n")
+                        output.write(m.seqs[s] + "\n")
+                        output.write(m.structs[s] + "\n")
+                    output.write("\n")
+
+            if tmp == False:
+                output.write("No motifs found.")
+
+    def save_to_result_file_with_alignment(self):
+        with open(os.path.join(self.output_file), 'w') as output:
+            for k in sorted(self.motifs, key=len, reverse=True):
+                for m in self.motifs[k]:
+                    if len(m.parent) != 0:
+                        line = "@ID: " + str(m.motif_id) + "; Parent: " + ", ".join(
+                            str(x) for x in m.parent) + "; Count: " \
+                               + str(m.count) \
+                               + "; Length: " + str(m.med_length) \
+                               + "; Shape: " + k + "; Distance_str: " + str(
+                            m.struct_distance) + "; Distance_seq: " + str(m.med_distance) + "\n"
+                    else:
+                        line = "@ID: " + str(m.motif_id) + "; Parent: self; Count: " + str(m.count)
+                        line += "; Length: " + str(m.med_length)
+                        line += "; Shape: " + k + "; Distance_str: " + str(
+                            m.struct_distance) + "; Distance_seq: " + str(m.med_distance) + "\n"
+
+                    m.id_line = line
+                    lines = ""
+                    for i in range(0, len(m.ids)):
+                        lines += m.ids[i] + "\n"
+                        lines += m.seqs[i] + "\n"
+                        lines += m.structs[i] + "\n"
+
+                    # print(lines)
+                    x = threading.activeCount()
+                    while x > self.thread_number:
+                        x = threading.activeCount()
+                        time.sleep(1)
+                    new_t = threading.Thread(target=self.threading, args=(lines, m,))
+                    new_t.start()
+
+            x = threading.activeCount()
+            while x > 1:
+                x = threading.activeCount()
+                time.sleep(1)
+            for k in sorted(self.motifs, key=len, reverse=True):
+                for m in self.motifs[k]:
+                    output.write(m.id_line + "\n")
+                    compare = ""
+                    # print(m.alignment)
+                    for key in m.alignment:
+                        if len(key.rstrip()) > len(compare):
+                            compare = key.rstrip()
+                    compare += "	"
+                    for key in m.alignment:
+                        norm_key = (" ".join(key.strip().split("_"))).strip()
+                        norm_key = key.strip()
+                        while len(norm_key) < len(compare):
+                            norm_key += " "
+                        output.write("".join([norm_key, m.alignment[key][0], "\n"]))
+                        pause = " " * len(norm_key)
+                        output.write("".join([pause, m.alignment[key][1], "\n"]))
+                    output.write('\n')
+
+    def threading(self, lines, m):
+        ident = str(threading.current_thread()).split(",")[0].split("(")[-1]
+        aln = Alignment(lines, self.output_file, ident)
+        aln.write_aln_fasta()
+        dict = {}
+        with open(aln.out_file) as inpt:
+            for i in inpt:
+                if i.startswith(">"):
+                    dict[i.strip()] = [inpt.readline().strip(), inpt.readline().strip()]
+        m.alignment = dict
+        os.remove(aln.out_file)
+
+    def calculate_distances_inside_motif(self):
+
+        count = 0
+        for m in self.initial_motifs:
+            if len(self.initial_motifs[m]) > 1:
+                self.motifs[m] = []
+                count += 1
+        # print("Liczba motywow przed dystansem: ", count)
+        for m in sorted(self.initial_motifs, key=len, reverse=False):  # przejscie po klastrach
+            if len(self.initial_motifs[m]) > 1:  # kiedy jest wiecej niz jedna sekwencja z klastrze
+                count -= 1
+                x = threading.activeCount()
+                while x > self.thread_number:
+                    x = threading.activeCount()
+                    time.sleep(1)
+                # print(self.initial_motifs[m])
+                new_t = threading.Thread(target=self.clustering_method, args=(self.initial_motifs[m], m, count))
+                new_t.start()
+
+        x = threading.activeCount()
+        while x > 1:
+            x = threading.activeCount()
+            time.sleep(1)
+        if self.save_redundancy == "False":
+            self.remove_redundances()
+
+    def clustering_method(self, motif, key, number):
+        # print(key, number)
+        stem_arrangement = []
+        seq_id = []
+        names = []
+        cnt = 0
+        for seq in motif:
+            stem_arrangement.append(seq.stems_len)
+
+        X = pdist(stem_arrangement, 'euclidean')
+        square = squareform(X)
+
+        linkage = fastcluster.linkage(square, method="single")
+
+        d = StemClustering()
+        d.clustering_by_stems(square, motif, key, self.strdistance)
+        # print(key, "after structural clustering")
+
+        """ ta wersja dziala/fragmenty sekwencji
+		for num in d.new_motifs:
+			print(d.distances[num])
+			if len(d.new_motifs[num]) > 1:
+				single_stranded_sequences, ss_number = self.extract_single_stranded_sequences(d.new_motifs[num], key)
+				headers = [*single_stranded_sequences]
+				matrix = np.zeros((len(headers),len(headers)), dtype='float64')
+				for nr in range(0, ss_number):
+					seq = []
+					empty_sequence = []
+					for x, h in enumerate(headers):
+						seq.append(single_stranded_sequences[h][nr])
+						if single_stranded_sequences[h][nr] == '':
+							empty_sequence.append(x)
+					if len(empty_sequence) == len(seq):
+						matrix += 1
+					else:	
+						af = AlignmentFree(seq, headers, 3)
+						af.main()
+						af.result[:,empty_sequence] += 1
+						af.result[empty_sequence,:] += 1
+						matrix += af.result
+				np.fill_diagonal(matrix, 0)
+				if np.count_nonzero(matrix) > 0:
+					matrix = matrix/np.max(matrix)
+				np.fill_diagonal(matrix, 1)
+				"""
+
+        # print(len(d.new_motifs))
+        for num in d.new_motifs:
+            if len(d.new_motifs[num]) > 1:
+                seq = []
+                headers = []
+                length = []
+                cnt = 0
+                for m in d.new_motifs[num]:
+                    seq.append(m.sequence)
+                    headers.append(m.id)
+                    length.append(len(m.sequence))
+                    cnt += 1
+
+                # print(cnt, min(length), max(length), np.mean(length))
+                start = time.time()
+                af = AlignmentFree(seq, headers, 3)
+                af.main()
+                end = time.time()
+                # print("Time alignment: ", str(round(end-start, 2)))
+                matrix = af.result
+                s = SequenceClustering()
+                sequence_motifs = s.clustering_by_sequence(matrix, d.new_motifs[num], self.seqdistance,
+                                                           d.distances[num])
+                if sequence_motifs != []:
+                    # print(sequence_motifs)
+                    L.acquire()
+                    self.motifs[key].extend(sequence_motifs)
+                    L.release()
+                    del s
+                    d.new_motifs[num] = []
+        # print(key, "after sequential clustering")
+
+    def sequence_pairwise_alignment(self, seq_i, seq_j):
+        # print(seq_i, seq_j)
+        full_score = 0.0
+        for i in range(0, len(seq_i)):
+            if len(seq_i[i]) >= 3 and len(seq_j[i]) >= 3:
+                alignment = pairwise2.align.localxx(seq_i[i], seq_j[i], score_only=True)
+                full_score += alignment
+        # print("full: ",full_score)
+        return full_score
+
+    def extract_single_stranded_sequences(self, motif, shape):
+        ss_regions_for_sequences = {}
+        cnt = 0
+        for m in motif:
+            ss_regions_for_sequences[m.id] = []
+
+        for i, s in enumerate(shape[0:-1]):
+            if s == "[" and shape[i + 1] == "]":
+                cnt += 1
+                for m in motif:
+                    # print(m.structure)
+                    # print(m.positions)
+                    # print(i)
+                    if len(m.sequence[m.positions[i][1] + 1: m.positions[i + 1][0]]) >= 3:
+                        ss_regions_for_sequences[m.id].append(m.sequence[m.positions[i][1] + 1: m.positions[i + 1][0]])
+                    else:
+                        ss_regions_for_sequences[m.id].append('')
+            if s == "]" and shape[i + 1] == "[":
+                cnt += 1
+                for m in motif:
+                    if len(m.sequence[m.positions[i][1] + 1: m.positions[i + 1][0]]) >= 3:
+                        ss_regions_for_sequences[m.id].append(m.sequence[m.positions[i][1] + 1: m.positions[i + 1][0]])
+                    else:
+                        ss_regions_for_sequences[m.id].append('')
+
+        return ss_regions_for_sequences, cnt
+
+    def remove_redundances(self):
+        #print("Usuwam redundancje")
+        after_red = {}
+        no_redund = []
+        unique = []
+        bedformat = ""
+
+        for key in self.motifs:
+            for e, submotif in enumerate(self.motifs[key]):
+                for i in submotif.ids:
+                    # print(i, key)
+                    bedformat += i.split("|")[0].strip()[1:] + "\t" + i.split("|")[1].split("-")[0] + "\t" + \
+                                 i.split("|")[1].split("-")[1] + "\t" + key + "_" + str(e) + "\n"
+        bedFile = pybedtools.BedTool(bedformat, from_string=True)
+
+        with open("bed.bed", 'w') as out:
+            out.write(bedformat)
+
+        res = bedFile.intersect(bedFile, loj=True, F=1)
+
+        for r in res:
+            a = r[:4]
+            b = r[4:]
+            if a != b:
+                no_redund.append(b)
+
+        for b in bedFile:
+            if b[:] not in no_redund:
+                if b[3] not in unique:
+                    unique.append(b[3])
+                    key = b[3].split("_")[0]
+                    position = int(b[3].split("_")[1])
+                    if key not in after_red:
+                        after_red[key] = []
+                    after_red[key].append(self.motifs[key][position])
+
+        del self.motifs
+        self.motifs = after_red
+        del after_red
+
+    def add_shapes(self, sequence_id, sequence, structure):
+        s = Structure()
+        s.bracket = structure
+        s.bracket_to_shape()
+        struct_info = StructureInfo()
+        struct_info.sequence_id = sequence_id.strip()
+        struct_info.sequence = sequence.strip()
+        struct_info.structure = structure.strip()
+        struct_info.shape = s.shape
+        # print(s.shape)
+        struct_info.positions = s.shape_position_hairpins
+        struct_info.stems_len = s.shape_position
+
+        parens = self.find_parens(struct_info.shape)
+        structure_params = []
+        for p in sorted(parens):
+            count = int((parens[p] - p - 1) / 2)
+            structure_params.append((count, p, parens[p]))
+
+        all_possible_domains = []
+        all_possible_domains = self.split(structure_params, all_possible_domains)
+        domains = self.add_info_to_domains(struct_info, all_possible_domains)
+
+        del struct_info
+        return domains
+
+    def add_info_to_domains(self, whole_info, domains):
+        parsed_domains = []
+        for i in domains:
+            start = whole_info.positions[i[0]]
+            stop = whole_info.positions[i[1]]
+            new_id = whole_info.sequence_id + "|" + str(start) + "-" + str(stop)
+            shape = whole_info.shape[i[0]: i[1] + 1]
+            positions = whole_info.positions[i[0]:i[1] + 1]
+            sequence = whole_info.sequence[start:stop + 1]
+            structure = whole_info.structure[start:stop + 1]
+            stems_length = []
+            for j in range(i[0], i[1] + 1):
+                if "(" in whole_info.structure[whole_info.stems_len[j][0]:whole_info.stems_len[j][1] + 1]:
+                    stems_length.append(whole_info.stems_len[j][1] - whole_info.stems_len[j][0] + 1)
+
+            m = Motif()
+            m.id = new_id
+            m.shape = shape
+            m.sequence = sequence
+            m.structure = structure
+            m.stems_len = stems_length
+            m.positions = positions
+            parsed_domains.append(m)
+        return parsed_domains
+
+    def split(self, struct_params, domains):
+        for x, y in enumerate(struct_params):
+            if y[0] == 0:  # jezeli znajduje sie jedna spinka / zostaje dalej
+                pass
+            elif y[0] == 1:  # jezeli wewnatrz jest jedna spinka
+                domains.append((struct_params[x + y[0]][1], struct_params[x + y[0]][2]))
+                del (struct_params[x + 1])
+            elif y[0] == 2:  # jeżeli wewnątrz są dwie spinki
+                domains.append((struct_params[x + y[0] - 1][1], struct_params[x + y[0]][2]))
+                domains.append((struct_params[x + y[0] - 1][1], struct_params[x + y[0] - 1][2]))
+                domains.append((struct_params[x + y[0]][1], struct_params[x + y[0]][2]))
+                del (struct_params[x + 1])
+                del (struct_params[x + 1])
+            elif y[0] > 2:  # jezeli wewnatrz jest wieksza struktura / rekurencja
+                substruct_params = [struct_params[i] for i in range(x + 1, x + y[0] + 1)]
+                domains = self.split(substruct_params, domains)
+                for i in range(0, y[0]):
+                    del (struct_params[x + 1])
+        for x in range(0, len(struct_params)):
+            start = struct_params[x][1]
+            stop = struct_params[x][2]
+            domains.append((start, stop))
+            for y in range(x + 1, len(struct_params)):
+                stop = struct_params[y][2]
+                domains.append((start, stop))
+        return domains
+
+    def find_parens(self, s):
+        toret = {}
+        pstack = []
+
+        for i, c in enumerate(s):
+            if c == '[':
+                pstack.append(i)
+            elif c == ']':
+                if len(pstack) == 0:
+                    raise IndexError("No matching closing parens at: " + str(i))
+                toret[pstack.pop()] = i
+
+        if len(pstack) > 0:
+            raise IndexError("No matching opening parens at: " + str(pstack.pop()))
+        return toret
+
+
+if __name__ == '__main__':
+
+    OUTPUT_NAME = ""
+    HAIRPIN = False
+    THREADS = 0
+    DISTANCE = 0.0
+    FORM = ""
+    REDUNDANCY = ""
+    start = time.time()
+    # =================== parse arguments
+
+    parser = argparse.ArgumentParser(description='')
+    parser.add_argument('-i', '--input', help='Input fasta file. Requires sequence and structure.', required=True)
+    parser.add_argument('-o', '--output', help='Output file name. Default: rnaSMART_result_sst_sqt.txt',
+                        required=False)
+    parser.add_argument('-t', '--threads', help='Number of threads to use. Default: 1', required=False)
+    parser.add_argument('-sst', '--secondary_structure_threshold', dest='structure_threshold',
+                        help='Clustering threshold for RNAs secondary structures. Default: 0.05', required=False)
+    parser.add_argument('-sqt', '--sequence_threshold', dest='sequence_threshold',
+                        help='Clustering threshold for RNAs sequences. Default: 0.05', required=False)
+    parser.add_argument('-sh', '--single_hairpin',
+                        help='Include single hairpin motifs in analysis. Significantly increases analysis time. Default: False',
+                        required=False, action='store_false')
+    parser.add_argument('-a', '--alignment',
+                        help='The result motifs are presented as alignment with 4sale tool. Default: fasta format result',
+                        required=False,
+                        action='store_false')
+    parser.add_argument('-r', '--save_redundancy',
+                        help='Not removing redundant motifs. Useful when looking for small motifs.',
+                        required=False,
+                        action='store_false')
+    args = vars(parser.parse_args())
+
+    INPUT_NAME = args['input']
+
+    if args['threads'] is None:
+        THREADS = 2
+    else:
+        THREADS = int(args['threads'])
+
+    if args['structure_threshold'] is None:
+        STRDISTANCE = str(-1)
+    else:
+        STRDISTANCE = args['structure_threshold']
+
+    if args['sequence_threshold'] is None:
+        SEQDISTANCE = str(-1)
+    else:
+        SEQDISTANCE = args['sequence_threshold']
+
+    if args['output'] is None:
+        OUTPUT_NAME = 'rnaSMART_results_' + STRDISTANCE + '_' + SEQDISTANCE + "_" + ''.join(
+            random.choice(string.ascii_uppercase + string.digits) for _ in range(5)) + ".txt"
+    else:
+        OUTPUT_NAME = args['output']
+
+    if args['single_hairpin'] is True:
+        HAIRPIN = "False"
+    else:
+        HAIRPIN = "True"
+
+    if args['alignment'] is True:
+        FORM = "fasta"
+    else:
+        FORM = "4sale"
+
+    if args['save_redundancy'] is True:
+        REDUNDANCY = "False"
+    else:
+        REDUNDANCY = "True"
+
+    #print(INPUT_NAME, OUTPUT_NAME, THREADS, STRDISTANCE, SEQDISTANCE, HAIRPIN, FORM, REDUNDANCY)
+    #exit()
+    r = rnaSMART(INPUT_NAME, OUTPUT_NAME, THREADS, STRDISTANCE, SEQDISTANCE, HAIRPIN, FORM, REDUNDANCY)
+    r.parse_input_file()
+    end = time.time()
+    #print("Time: ", str(round(end - start, 2)))
