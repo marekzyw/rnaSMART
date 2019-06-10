@@ -113,3 +113,5 @@ Aligned format result:
 If you notice any mistakes in content or formatting, please send a pull request with your correction.
 
 ### Licence
+
+This project is licensed under the terms of the GNU General Public License v3.0 license.
