@@ -33,8 +33,10 @@ On Debian-based systems (e.g. Ubuntu) you can simply follow the instructions:
 	 or download a .zip package and unpack it:
    
 	 ```wget https://github.com/marekzyw/rnaSMART/archive/master.zip```
+	 
 	 ```unzip master.zip```
  
+ &nbsp;
 
 ## Quick start
 
@@ -46,7 +48,7 @@ To show full list of available  options type:
 
 ```rnaSMART -h```
 
-
+&nbsp;
 
 ## Detailed usage
 ### Options
@@ -152,7 +154,7 @@ Aligned format result:
 
 ### Contribute
 
-If you notice any errors and mistakes, or would like to suggest some new features, please use Github's issue system to report it. You are also welcome to send a pull request with your corrections.
+If you notice any errors and mistakes, or would like to suggest some new features, please use Github's issue tracking system to report it. You are also welcome to send a pull request with your corrections and suggestions.
 
 ### Licence
 
