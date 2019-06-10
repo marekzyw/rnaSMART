@@ -2,6 +2,8 @@
 
 ### Requirements
 
+Python 3.5 required.
+
 + matplotlib 
 + pybedtools    
 + fastcluster    
@@ -77,7 +79,8 @@ The main file of rnaSMART program is *rnaSMART.py* file. To show program help ty
 rnaSMART requires input file in fasta-like format, containing both sequences and secondary structures in dot-bracket format.
 Sample input file is provided in "sample" folder.
 
-"RNASTRAND.fasta" consists of 401 RNA sequences obtained from RNA STRAND database [1].
+"RNASTRAND.fasta" consists of 401 RNA sequences obtained from [RNA STRAND](http://www.rnasoft.ca/strand/) database.
+Sequences were pre-filtered. Pseudoknots, non-canonical base pairs, single hairpins and uncomplete sequences were removed.
 
 ### Output file
 
