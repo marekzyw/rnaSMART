@@ -1,4 +1,4 @@
-# rnaSMART - tool for identification of Structural Motifs Across Transcripts
+# rnaSMART - tool for identification of Structural Motifs Across RNA Transcripts
 
 ## Installation
 
@@ -34,7 +34,7 @@ On Debian-based systems (e.g. Ubuntu) you can simply follow the instructions:
    
 	 ```wget https://github.com/marekzyw/rnaSMART/archive/master.zip```
 	 
-	 ```unzip master.zip```
+	 ```unzip rnaSMART-master.zip```
  
  &nbsp;
 
